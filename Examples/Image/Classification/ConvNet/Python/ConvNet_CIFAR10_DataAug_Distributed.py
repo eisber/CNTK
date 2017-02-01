@@ -121,42 +121,19 @@ def train_and_test(network, trainer, train_source, test_source, progress_printer
         network['label']: train_source.streams.labels
     }
 
-    training_session = cntk.training_session(train_source, trainer,
-                                             cntk.minibatch_size_schedule(64),
-                                             progress_printer, input_map,
-                                             os.path.join(model_path, "ConvNet_CIFAR10_DataAug_"),
-                                             epoch_size)
+    training_session = cntk.training_session(
+        training_minibatch_source = train_source,
+        trainer = trainer,
+        model_inputs_to_mb_source_mapping = input_map, 
+        mb_size_schedule = cntk.minibatch_size_schedule(64),
+        progress_printer = progress_printer, 
+        checkpoint_filename = os.path.join(model_path, "ConvNet_CIFAR10_DataAug"),
+        progress_frequency=epoch_size,
+        cv_source = test_source,
+        cv_mb_size_schedule=cntk.minibatch_size_schedule(16))
+
     # Train all minibatches 
     training_session.train()
-
-    ### TODO: Stay tuned for an upcoming simpler EvalSession API for test/validation.    
-
-    ### Evaluation action
-    minibatch_size = 16
-
-    # process minibatches and evaluate the model
-    metric_numer    = 0
-    metric_denom    = 0
-    minibatch_index = 0
-
-    # Test minibatch loop
-    while True:
-        data = test_source.next_minibatch(minibatch_size, input_map=input_map)
-        if not data: break
-        local_mb_samples=data[network['label']].num_samples
-        metric_numer += trainer.test_minibatch(data) * local_mb_samples
-        metric_denom += local_mb_samples
-        minibatch_index += 1
-
-    fin_msg = "Final Results: Minibatch[1-{}]: errs = {:0.2f}% * {}".format(minibatch_index+1, (metric_numer*100.0)/metric_denom, metric_denom)
-    progress_printer.end_progress_print(fin_msg)
-
-    print("")
-    print(fin_msg)
-    print("")
-
-    return metric_numer/metric_denom
-
 
 # Train and evaluate the network.
 def convnet_cifar10_dataaug(train_data, test_data, mean_data, epoch_size=50000, num_quantization_bits=32, 

@@ -105,37 +105,17 @@ def train_and_test(network, trainer, train_source, test_source, progress_printer
         network['label']: train_source.streams.labels
     }
 
-    training_session = cntk.training_session(train_source, trainer,
-        cntk.minibatch_size_schedule(minibatch_size), progress_printer, input_map, "ConvNet_CIFAR10_DataAug_", epoch_size)
+    training_session = cntk.training_session(
+        training_minibatch_source = train_source, 
+        trainer = trainer,
+        mb_size_schedule = cntk.minibatch_size_schedule(minibatch_size),
+        progress_printer = progress_printer,
+        model_inputs_to_mb_source_mapping = input_map, 
+        checkpoint_filename="ResNet_CIFAR10_DataAug", 
+        progress_frequency=epoch_size,
+        cv_source=test_source,
+        cv_mb_size_schedule=cntk.minibatch_size_schedule(16))
     training_session.train()
-
-    # TODO: Stay tuned for an upcoming simpler EvalSession API for test/validation.
-    epoch_size     = 10000
-    minibatch_size = 16
-
-    # process minibatches and evaluate the model
-    metric_numer    = 0
-    metric_denom    = 0
-    sample_count    = 0
-    minibatch_index = 0
-
-    while True:
-        data = test_source.next_minibatch(minibatch_size, input_map=input_map)
-        if not data: break;
-
-        local_mb_samples=data[network['label']].num_samples
-        metric_numer += trainer.test_minibatch(data) * local_mb_samples
-        metric_denom += local_mb_samples
-        minibatch_index += 1
-
-    fin_msg = "Final Results: Minibatch[1-{}]: errs = {:0.2f}% * {}".format(minibatch_index+1, (metric_numer*100.0)/metric_denom, metric_denom)
-    progress_printer.end_progress_print(fin_msg)
-
-    print("")
-    print(fin_msg)
-    print("")
-
-    return metric_numer/metric_denom
 
 # Train and evaluate the network.
 def resnet_cifar10(train_data, test_data, mean_data, network_name, epoch_size, num_quantization_bits=32, block_size=3200, warm_up=0, max_epochs=5, log_to_file=None, num_mbs_per_log=None, gen_heartbeat=False, scale_up=False):
@@ -160,7 +140,7 @@ def resnet_cifar10(train_data, test_data, mean_data, network_name, epoch_size, n
     trainer = create_trainer(network, minibatch_size, epoch_size, num_quantization_bits, block_size, warm_up)
     train_source = create_image_mb_source(train_data, mean_data, train=True, total_number_of_samples=max_epochs * epoch_size)
     test_source = create_image_mb_source(test_data, mean_data, train=False, total_number_of_samples=cntk.io.FULL_DATA_SWEEP)
-    return train_and_test(network, trainer, train_source, test_source, progress_printer, minibatch_size, epoch_size)
+    train_and_test(network, trainer, train_source, test_source, progress_printer, minibatch_size, epoch_size)
 
 
 if __name__=='__main__':
