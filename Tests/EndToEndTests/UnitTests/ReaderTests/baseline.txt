@@ -1351,9 +1351,6 @@ Test module "ReaderTests" has passed with:
     Test case "ReaderTestSuite/CNTKTextFormatReader_missing_trailing_newline" has passed with:
       1 assertion out of 1 passed
 
-    Test case "ReaderTestSuite/CNTKTextFormatReader_missing_trailing_newline_ignored" has passed with:
-      1 assertion out of 1 passed
-
     Test case "ReaderTestSuite/CNTKTextFormatReader_blank_lines" has passed with:
       1 assertion out of 1 passed
 
@@ -1371,6 +1368,12 @@ Test module "ReaderTests" has passed with:
 
     Test case "ReaderTestSuite/CNTKTextFormatReader_invalid_inputs" has passed with:
       1 assertion out of 1 passed
+    
+    Test case "ReaderTestSuite/CNTKTextFormatReader_no_trailing_newline_valid_input" has passed with:
+      4 assertions out of 4 passed
+
+    Test case "ReaderTestSuite/CNTKTextFormatReader_no_trailing_newline_invalid_input" has passed with:
+      9 assertions out of 9 passed
 
     Test case "ReaderTestSuite/CNTKTextFormatReader_100x100x3" has passed with:
       1 assertion out of 1 passed

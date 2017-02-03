@@ -121,7 +121,7 @@ namespace Microsoft { namespace MSR { namespace CNTK {
     void ChunkRandomizer::RandomizeUsingWindowInChunks()
     {
         auto halfWindowRange = m_randomizationRange / 2;
-        auto windwowSize = m_randomizationRange == 0 ? 1 : ChunkIdType(m_randomizationRange + 1);
+        auto windwowSize = m_randomizationRange == 0 ? 1 : ChunkIdType(m_randomizationRange);
         for (auto i = 0; i < m_randomizedChunks.size(); i++)
         {
             auto& chunk = m_randomizedChunks[i];
