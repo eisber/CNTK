@@ -150,10 +150,18 @@ private:
             if (!m_nccl.IsSupported() && (deviceId != CPUDEVICE))
                 m_allocator.reset(new CUDAPageLockedMemAllocator(deviceId));
 
-            size_t totalGradientsSizeInElements = 0;
+            size_t PackedGradientsSizeInElements = 0;
             for (size_t i = 0; i < gradients.size(); i++)
             {
-                totalGradientsSizeInElements += gradients[i]->GetNumElements();
+                if (sizeof(ElemType) * gradients[i]->GetNumElements() <= m_packThresholdSize)
+                {
+                    PackedGradientsSizeInElements += gradients[i]->GetNumElements();
+                    m_PackedGradientsIndex.push_back(i);
+                }
+                else
+                {
+                    m_noPackedGradientsIndex.push_back(i);
+                }
 
                 // Make sure none of the gradient matrixes are sparse - we currently do not support aggregation of sparse gradient matrices
                 if (gradients[i]->GetMatrixType() != DENSE)
@@ -163,31 +171,41 @@ private:
                     m_bufferedGradients[gradients[i]].reset(new Matrix<ElemType>(gradients[i]->GetNumRows(), gradients[i]->GetNumCols(), deviceId));
             }
 
-            if (!m_nccl.IsSupported())
+            // Packing matrices into continous buffer if not doing async aggregation
+            m_AggregationBuffer.reset();
+            if (!m_useAsyncAggregation && PackedGradientsSizeInElements > 0)
             {
-                // Packing matrices into continous buffer if not doing async aggregation
-                m_AggregationBuffer.reset();
-                if (!m_useAsyncAggregation && (sizeof(ElemType) * totalGradientsSizeInElements <= m_packThresholdSize))
-                {
-                    m_AggregationBuffer.reset(new (std::nothrow) Matrix<ElemType>(1, totalGradientsSizeInElements, deviceId));
-                }
+                m_AggregationBuffer.reset(new (std::nothrow) Matrix<ElemType>(1, PackedGradientsSizeInElements, deviceId));
+            }
+            if (m_AggregationBuffer == 0)
+            {
+                fprintf(stderr, "Failed to allocate the continous buffer for gradient matrices.\n");
+                m_noPackedGradientsIndex.clear();
+                m_PackedGradientsIndex.clear();
+                PackedGradientsSizeInElements = 0;
+            }
 
-                if (deviceId != CPUDEVICE)
+            if (!m_nccl.IsSupported() && (deviceId != CPUDEVICE))
+            {
+                if (m_AggregationBuffer == 0)
                 {
-                    // Cannot allocate extra continous buffer
-                    if (m_AggregationBuffer == 0)
+                    for (size_t i = 0; i < gradients.size(); i++)
                     {
-                        fprintf(stderr, "Failed to get extra contious buffer\n");
-                        for (size_t i = 0; i < gradients.size(); i++)
-                        {
-                            m_gpuDataTransferers.push_back(std::make_unique<GPUDataTransferer>(deviceId, m_useAsyncAggregation));
-                            m_intermediateCPUBuffers.push_back(AllocateIntermediateBuffer(deviceId, gradients[i]->GetNumElements()));
-                        }
+                        m_gpuDataTransferers.push_back(std::make_unique<GPUDataTransferer>(deviceId, m_useAsyncAggregation));
+                        m_intermediateCPUBuffers.push_back(AllocateIntermediateBuffer(deviceId, gradients[i]->GetNumElements()));
                     }
-                    else
+                }
+                else
+                {
+                    for (size_t i : m_noPackedGradientsIndex)
+                    {
+                        m_gpuDataTransferers.push_back(std::make_unique<GPUDataTransferer>(deviceId, m_useAsyncAggregation));
+                        m_intermediateCPUBuffers.push_back(AllocateIntermediateBuffer(deviceId, gradients[i]->GetNumElements()));
+                    }
+                    if (PackedGradientsSizeInElements > 0)
                     {
                         m_gpuDataTransferer = std::make_unique<GPUDataTransferer>(deviceId, m_useAsyncAggregation);
-                        m_intermediateCPUBuffer = AllocateIntermediateBuffer(deviceId, totalGradientsSizeInElements);
+                        m_intermediateCPUBuffer = AllocateIntermediateBuffer(deviceId, PackedGradientsSizeInElements);
                     }
                 }
             }
@@ -218,6 +236,7 @@ private:
 
                 m_bufferedGradHeader->Clear();
             }
+            m_AggregationBuffer.reset();
         }
     }
 
@@ -256,23 +275,26 @@ private:
         if (m_AggregationBuffer != 0)
         {
             // If there are more than one gradients, do the packing
-            if (numGradMatrices != 1)
+            size_t offset = 0;
+            for (size_t i : m_PackedGradientsIndex)
             {
-                size_t offset = 0;
-                for (size_t i = 0; i < numGradMatrices; ++i)
-                {
-                    m_AggregationBuffer->ColumnSlice(offset, gradients[i]->GetNumElements()).AssignValuesOf(gradients[i]->Reshaped(1, gradients[i]->GetNumElements()));
-                    offset += gradients[i]->GetNumElements();
-                }
+                m_AggregationBuffer->ColumnSlice(offset, gradients[i]->GetNumElements()).AssignValuesOf(gradients[i]->Reshaped(1, gradients[i]->GetNumElements()));
+                offset += gradients[i]->GetNumElements();
             }
         }
 
         // Initiate transfer of the bufferred data to the CPU if needed
-        if (!m_nccl.IsSupported() && deviceId >= 0)
+        if (!m_nccl.IsSupported() && deviceId != CPUDEVICE)
         {
             if (m_AggregationBuffer != 0)
             {
                 m_gpuDataTransferer->CopyGPUToCPUAsync(m_AggregationBuffer->Data(), m_AggregationBuffer->GetNumElements(), m_intermediateCPUBuffer.get());
+                int gpuDataTransfersIdx = 0;
+                for (size_t i : m_noPackedGradientsIndex)
+                {
+                    m_gpuDataTransferers[gpuDataTransfersIdx]->CopyGPUToCPUAsync(gradients[i]->Data(), gradients[i]->GetNumElements(), m_intermediateCPUBuffers[gpuDataTransfersIdx].get());
+                    gpuDataTransfersIdx++;
+                }
             }
             else
             {
@@ -306,6 +328,7 @@ private:
         {
             if (m_AggregationBuffer != 0)
             {
+                // Do allreduce for packed continous buffer
                 ElemType* reductionBuffer = m_AggregationBuffer->Data();
                 if (deviceId >= 0)
                 {
@@ -316,6 +339,23 @@ private:
                 allReduceRequests.push_back(MPI_Request());
                 MPI_Iallreduce(MPI_IN_PLACE, reductionBuffer, m_AggregationBuffer->GetNumElements(),
                     MPIWrapper::GetDataType(reductionBuffer), MPI_SUM, m_mpi->Communicator(), &allReduceRequests[0]) || MpiFail("MPI_Iallreduce");
+
+                // Do allreduce for un-packed gradients
+                int gpuDataTransfersIdx = 0;
+                for (size_t i : m_noPackedGradientsIndex)
+                {
+                    allReduceRequests.push_back(MPI_Request());
+                    reductionBuffer = gradients[i]->Data();
+                    if (deviceId != CPUDEVICE)
+                    {
+                        m_gpuDataTransferers[gpuDataTransfersIdx]->WaitForCopyGPUToCPUAsync();
+                        reductionBuffer = m_intermediateCPUBuffers[gpuDataTransfersIdx].get();
+                    }
+
+                    MPI_Iallreduce(MPI_IN_PLACE, reductionBuffer, gradients[i]->GetNumElements(),
+                        MPIWrapper::GetDataType(reductionBuffer), MPI_SUM, m_mpi->Communicator(), &allReduceRequests[gpuDataTransfersIdx + 1]) || MpiFail("MPI_Iallreduce");
+                    gpuDataTransfersIdx++;
+                }
             }
             else
             {
@@ -337,13 +377,17 @@ private:
         } 
         else
         {
-            if (m_AggregationBuffer == 0 || numGradMatrices == 1)
+            if (m_AggregationBuffer == 0)
             {
                 m_nccl.AllReduce(gradients);
             }
             else
             {
                 m_nccl.AllReduce(m_AggregationBuffer.get());
+                for (size_t i : m_noPackedGradientsIndex)
+                {
+                    m_nccl.AllReduce(gradients[i]);
+                }
             }
         }
 
@@ -394,18 +438,26 @@ private:
                     m_gpuDataTransferer->CopyCPUToGPUAsync(m_intermediateCPUBuffer.get(), m_AggregationBuffer->GetNumElements(), m_AggregationBuffer->Data());
                     m_gpuDataTransferer->WaitForCopyCPUToGPUAsync();
                 }
+
+                size_t gpuDataTransfersIdx = 0; // Index of allReduceRequest for each un-packed gradient
+                for (size_t i : m_noPackedGradientsIndex)
+                {
+                    MPI_Wait(&allReduceRequests[gpuDataTransfersIdx + 1], MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
+                    if (deviceId >= 0)
+                    {
+                        m_gpuDataTransferers[gpuDataTransfersIdx]->CopyCPUToGPUAsync(m_intermediateCPUBuffers[gpuDataTransfersIdx].get(), gradients[i]->GetNumElements(), gradients[i]->Data());
+                    }
+                    gpuDataTransfersIdx++;
+                }
             }
 
             // Copy all gradient data back from the single contiguous buffer used for aggregation
-            if (numGradMatrices != 1)
+            size_t offset = 0;
+            for (size_t i : m_PackedGradientsIndex)
             {
-                size_t offset = 0;
-                for (size_t i = 0; i < numGradMatrices; ++i)
-                {
-                    gradients[i]->AssignValuesOf(m_AggregationBuffer->ColumnSlice(offset, gradients[i]->GetNumElements()).Reshaped(gradients[i]->GetNumRows(), gradients[i]->GetNumCols()));
-                    offset += gradients[i]->GetNumElements();
+                gradients[i]->AssignValuesOf(m_AggregationBuffer->ColumnSlice(offset, gradients[i]->GetNumElements()).Reshaped(gradients[i]->GetNumRows(), gradients[i]->GetNumCols()));
+                offset += gradients[i]->GetNumElements();
 
-                }
             }
         }
         else if (!m_nccl.IsSupported())
@@ -414,14 +466,26 @@ private:
             {
                 MPI_Wait(&allReduceRequests[i], MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
                 if (deviceId >= 0)
+                {
                     m_gpuDataTransferers[i]->CopyCPUToGPUAsync(m_intermediateCPUBuffers[i].get(), gradients[i]->GetNumElements(), gradients[i]->Data());
+                }
             }
         }
         
-        if (deviceId >= 0 && m_AggregationBuffer == 0)
+        if (deviceId != CPUDEVICE && !m_nccl.IsSupported())
         {
-            for (size_t i = 0; i < numGradMatrices; ++i)
-                m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
+            if (m_AggregationBuffer == 0)
+            {
+                for (size_t i = 0; i < numGradMatrices; ++i)
+                    m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
+            }
+            else
+            {
+                for (size_t i = 0; i < m_noPackedGradientsIndex.size(); i++)
+                {
+                    m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
+                }
+            }
         }
 
         // Wait for completion of the async send requests
@@ -453,14 +517,15 @@ private:
     // Future corresponding to the current in-flight async gradient aggregation
     std::future<void> m_pendingAsyncAggregation;
 
-    // Threshold size to pack all gradients in a continous buffer
-    size_t m_packThresholdSize;
-
     // Buffered gradients that we asynchronously aggregate
     std::unordered_map<Matrix<ElemType>*, std::unique_ptr<Matrix<ElemType>>> m_bufferedGradients;
     DistGradHeader* m_bufferedGradHeader;
 
+    // Threshold size to pack all gradients in a continous buffer
+    size_t m_packThresholdSize;
     std::unique_ptr<Matrix<ElemType>> m_AggregationBuffer;
+    std::vector<size_t> m_PackedGradientsIndex;
+    std::vector<size_t> m_noPackedGradientsIndex;
 
     int m_syncStatsTrace;
 
